@@ -76,7 +76,10 @@ def main():
         ret, frame = cap.read()
 
         # チェスボードのコーナーを検出
-        found, corner = cv.findChessboardCorners(frame, grid_intersection_size)
+        # ※cornerSubPix()には描画前の画像を使用するため、ここでグレースケール化する
+        gray_image = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+        found, corner = cv.findChessboardCorners(gray_image,
+                                                 grid_intersection_size)
 
         if found:
             print('findChessboardCorners() : True')
@@ -96,10 +99,11 @@ def main():
         if ((use_autoappend is True) and found) or (
             (use_autoappend is False and key == 13) and found):  # Enter
             # チェスボードコーナー検出情報を追加
-            gray_image = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
             cv.cornerSubPix(gray_image, corner, (3, 3), (-1, -1),
                             subpix_criteria)
-            image_points.append(corner)
+            # OpenCV 5系のfindChessboardCorners()は(N, 2)を返すが、
+            # omnidir.calibrate()はobject_pointsと同じ(1, N, 2)を要求する
+            image_points.append(corner.reshape(1, -1, 2))
             object_points.append(pattern_points)
             capture_count += 1
         if key == 27:  # ESC

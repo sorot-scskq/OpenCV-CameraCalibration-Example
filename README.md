@@ -13,8 +13,15 @@ OpenCVを用いたカメラキャリブレーションのサンプルです<br>
 
 
 # Requirement 
-* opencv-python 4.5.2.54 or later
-* opencv-contrib-python 4.5.2.54 or later ※omnidirモジュールを使用する場合のみ
+* opencv-python 5.0.0.93 or later
+* opencv-contrib-python 5.0.0.93 or later ※omnidirモジュールを使用する場合のみ
+
+OpenCV 5系でPython APIに互換性のない修正が入ったため、サンプルは5系に合わせています。<br>
+4系で動作させたい場合は[4.5.2.54対応版](https://github.com/Kazuhito00/OpenCV-CameraCalibration-Example/tree/d4805c7)を参照してください。
+* `findChessboardCorners()`の戻り値形状が`(N, 1, 2)`から`(N, 2)`へ変更<br>
+  ([1D and 0D array semantics](https://github.com/opencv/opencv/wiki/OpenCV-4-to-5-migration#1d-and-0d-array-semantics)に伴う変更)
+* fisheyeの`CALIB_*`定数がcv名前空間へ統合(`cv.fisheye.CALIB_FIX_SKEW` → `cv.CALIB_FIX_SKEW`)<br>
+  ([PR #23990](https://github.com/opencv/opencv/pull/23990)) ※定数の値自体も変更されているため注意
 
 # Calibration Pattern
 サンプルでは以下の7×10のチェスボード型のキャリブレーションパターンを使用します。

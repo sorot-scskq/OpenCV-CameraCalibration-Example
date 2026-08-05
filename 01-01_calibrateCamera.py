@@ -119,7 +119,10 @@ def main():
         for i in range(len(object_points)):
             image_points2, _ = cv.projectPoints(object_points[i], r[i], t[i],
                                                 camera_mat, dist_coef)
-            error = cv.norm(image_points[i], image_points2,
+            # OpenCV 5系のfindChessboardCorners()は(N, 2)、
+            # projectPoints()は(N, 1, 2)を返し型が一致しないため形状を揃える
+            error = cv.norm(image_points[i].reshape(-1, 2),
+                            image_points2.reshape(-1, 2),
                             cv.NORM_L2) / len(image_points2)
             mean_error += error
         print("total error: " +
