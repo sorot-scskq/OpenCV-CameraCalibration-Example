@@ -53,6 +53,26 @@ MIN_SHARPNESS = 40.0
 VIDEO_EXT = ('.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mts')
 IMAGE_EXT = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
 
+#: 走行するときの絵の大きさ。**ここと違う大きさで校正したら警告する**
+#:
+#: 歪みの係数（k1 k2 p1 p2 k3）は正規化座標に掛かるので、それ自体は解像度に依らない。
+#: `fx fy cx cy` は画素なので比例し、倍率を掛ければ移せる——**縮小しているだけなら。**
+#:
+#: **多くの USB カメラは、解像度を変えると切り出し方まで変える。** そうなると画角が
+#: 別物になり、どう倍率を掛けても移せない。縮小か切り出しかは外から分からないので、
+#: **走行と同じ大きさで撮る**のが唯一の安全な規則。
+#:
+#: **それだけではない。縮小しているだけでも、係数の当てはめが荒くなる。**
+#: 同じ合成写真を 1280x720 と、それを単純に縮小した 640x360 で解いた実測:
+#:
+#:     1280x720   fx 1249.7  hfov 54.24°  k1 -0.3587  k2 +0.1799  k3 -0.1668
+#:      640x360   fx  624.0  hfov 54.30°  k1 -0.3228  k2 -0.2614  k3 +1.4088
+#:
+#: `fx` はきれいに半分になり画角も合うが、**`k1` は 10% ずれ、`k2`/`k3` は符号ごと
+#: 変わっている**（角の位置の精度が落ち、高次の項が互いに融通し合うため）。
+#: **切り出しが無い理想の場合ですらこれだけ動く。**
+RUN_SIZE = (1280, 720)
+
 
 def get_args():
     parser = argparse.ArgumentParser(
@@ -403,6 +423,16 @@ def main():
         per_image.append(float(np.sqrt((diff ** 2).sum() / len(diff))))
 
     width, height = collector.size
+    if (width, height) != RUN_SIZE:
+        print('\n**注意: %dx%d で校正しました。走行は %dx%d です。**' % (
+            width, height, RUN_SIZE[0], RUN_SIZE[1]))
+        print('  歪みの係数は解像度に依りませんが、**fx fy cx cy は画素なので'
+              '倍率を掛けないと使えません**（x%.3f / y%.3f）。' % (
+                  RUN_SIZE[0] / width, RUN_SIZE[1] / height))
+        print('  **さらに、カメラが解像度で切り出し方を変えていると、倍率では'
+              '移せません**（画角が別物になる）。')
+        print('  **走行と同じ %dx%d で撮り直すのが確実です。**' % RUN_SIZE)
+
     shifts = edge_shift(K, d, width, height)
     hfov = math.degrees(2 * math.atan(width / 2 / K[0][0]))
     vfov = math.degrees(2 * math.atan(height / 2 / K[1][1]))
