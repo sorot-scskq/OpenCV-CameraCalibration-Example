@@ -3,16 +3,23 @@
 """
 チェスボードからカメラの内部パラメータと歪み係数を求める。
 
-本家（Kazuhito00/OpenCV-CameraCalibration-Example）からの変更点は README の
-「走行体で使うための変更」を参照。要点だけ:
+**動画を1本撮って、これに渡すだけで終わる。**
 
-* `--images` を足した。**画面の無い機械（SSH 越しの走行体）で使えるようにするため**
-* `cornerSubPix()` を足した。**角を画素より細かく詰めないと残差が倍になる**
-* **画面のどこがまだ埋まっていないか**を出す。歪みは縁で効くので、
-  真ん中ばかり撮っても決まらない
-* **縁が何画素動くか**を出す。「歪みを取る価値があるか」の答えはこれ
-* 1枚ごとの再投影誤差を出す。**悪い1枚が全体を引っぱっていないか**を見る
-* `eval()` をやめ、`CAP_DSHOW` を Windows のときだけにした
+    python 01-01_calibrateCamera.py calib.mp4
+
+画像の束でもフォルダでもよい。
+
+    python 01-01_calibrateCamera.py 'chess/*.png'
+    python 01-01_calibrateCamera.py chess/
+
+何も渡さなければ、本家どおりカメラを開いて画面を見ながら撮る
+（**画面のある機械でだけ動く**）。
+
+盤は同梱の `chessboard_a4.pdf`（1マス 24.0mm・内側の角 9x6）を前提にしている。
+**A3 を刷ったときと、刷った紙の物差しが 100.0mm でなかったときだけ** `--square_len`
+を渡す（README の「盤の PDF を同梱した」を参照）。
+
+本家からの変更点は README の「走行体で使うための変更」にまとめてある。
 """
 import argparse
 import glob
@@ -24,52 +31,40 @@ import sys
 import cv2 as cv
 import numpy as np
 
+#: 盤（同梱の chessboard_a4.pdf）。**内側の角**の数で、マスの数ではない
+GRID_SIZE = (9, 6)
+#: 同上、1マスの長さ[mm]
+SQUARE_LEN = 24.0
+
 #: 埋まりを数えるときの画面の分割
 COVER_COLS = 4
 COVER_ROWS = 3
 
+#: 動画を何枚おきに見るか。30fps なら 5 で毎秒6枚。**全部見ても精度は上がらない**
+VIDEO_STEP = 5
+#: 動画から採る上限。**似た絵を増やしても精度は上がらず、遅くなるだけ**
+VIDEO_MAX_FRAMES = 40
+#: 直前に採った枚から、角が平均で何px動いたら別の姿勢とみなすか
+VIDEO_MIN_MOVE_PX = 40.0
+#: ラプラシアンの分散の下限。**動画は必ずブレるので、ここで捨てる**
+MIN_SHARPNESS = 40.0
+
+#: 動画・画像として扱う拡張子
+VIDEO_EXT = ('.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mts')
+IMAGE_EXT = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+
 
 def get_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--file", type=str, default=None)
+    parser = argparse.ArgumentParser(
+        description='チェスボードからカメラの歪みを求める（動画1本でよい）')
     parser.add_argument(
-        "--images",
-        type=str,
-        default=None,
-        help="画像から求める（例 'chess/*.png'）。**画面もカメラも要らない**")
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
-
-    parser.add_argument("--square_len", type=float, default=23.0)
+        'input', nargs='?', default=None,
+        help='動画 / 画像のフォルダ / 画像のパターン。省くとカメラを開く')
     parser.add_argument(
-        "--grid_size",
-        type=str,
-        default="10,7",
-        help="**内側の角**の数。マスの数ではない（10x7 マスの盤は 9,6）")
-
-    parser.add_argument("--k_filename", type=str, default="K.csv")
-    parser.add_argument("--d_filename", type=str, default="d.csv")
-    parser.add_argument("--json_filename", type=str, default="calibration.json")
-
-    parser.add_argument("--interval_time", type=int, default=500)
-    parser.add_argument('--use_autoappend', action='store_true')
-
-    args = parser.parse_args()
-
-    return args
-
-
-def parse_grid_size(text):
-    """`"10,7"` を `(10, 7)` にする。**`eval()` は使わない**"""
-    try:
-        values = tuple(int(v) for v in text.replace('x', ',').split(','))
-    except ValueError:
-        values = ()
-    if len(values) != 2:
-        raise SystemExit('--grid_size は "10,7" の形で渡してください（内側の角の数）')
-    return values
+        '--square_len', type=float, default=SQUARE_LEN,
+        help='1マスの長さ[mm]。**刷った紙の物差しを定規で測った値**（既定 %.1f）'
+             % SQUARE_LEN)
+    return parser.parse_args()
 
 
 class Coverage:
@@ -97,13 +92,23 @@ class Coverage:
         floor = need * self.points_per_image // 8
         return sum(1 for row in self.cells for v in row if v < floor)
 
+    def gain(self, corners, need=2):
+        """この枚を採ると、薄いマスがいくつ埋まるか"""
+        before = self.thin(need)
+        saved = [row[:] for row in self.cells]
+        self.add(corners)
+        after = self.thin(need)
+        self.cells = saved
+        return before - after
+
     def show(self):
         print('画面の埋まり（左上から。数は角の点の数）:')
         for row in self.cells:
             print('   ' + ' '.join('%4d' % v for v in row))
         thin = self.thin()
         if thin:
-            print('**まだ %d マスが薄い。そこへ盤を運んで撮り足すこと。**' % thin)
+            print('**まだ %d マスが薄い。そこを狙ってもう一度撮ると、答えが締まる。**'
+                  % thin)
         else:
             print('全マス足りている。')
 
@@ -114,175 +119,242 @@ def refine(gray, corner):
     return cv.cornerSubPix(gray, corner, (11, 11), (-1, -1), criteria)
 
 
+def sharpness(gray):
+    return cv.Laplacian(gray, cv.CV_64F).var()
+
+
 def edge_shift(K, d, width, height):
     """**縁が何画素動くか。** これが小さいなら、歪みはその症状の原因ではない"""
     probes = np.array([[[0.0, 0.0]], [[width - 1.0, 0.0]], [[0.0, height - 1.0]],
                        [[width - 1.0, height - 1.0]],
                        [[width / 2.0, 0.0]], [[width / 2.0, height - 1.0]]])
     fixed = cv.undistortPoints(probes, K, d, P=K)
-    return [float(np.hypot(*(fixed[i][0] - probes[i][0]))) for i in range(len(probes))]
+    return [float(np.hypot(*(fixed[i][0] - probes[i][0])))
+            for i in range(len(probes))]
 
 
-def collect_from_images(pattern, grid_intersection_size, pattern_points):
-    """画像の束から角を拾う。**画面もカメラも要らない**"""
-    paths = sorted(glob.glob(os.path.expanduser(pattern)))
-    if not paths:
-        raise SystemExit('画像が見つかりません: %s' % pattern)
-    print('画像 %d 枚' % len(paths))
+class Collector:
+    """盤の角を集める。動画でも画像でもカメラでも、集め方だけが違う"""
 
-    object_points, image_points, used, size, coverage = [], [], [], None, None
-    for path in paths:
-        frame = cv.imread(path)
-        if frame is None:
-            continue
-        gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-        if size is None:
-            size = (gray.shape[1], gray.shape[0])
-            coverage = Coverage(size[0], size[1], np.prod(grid_intersection_size))
-        elif (gray.shape[1], gray.shape[0]) != size:
-            print('  %s は大きさが違う（捨てた）' % os.path.basename(path))
-            continue
-        found, corner = cv.findChessboardCorners(gray, grid_intersection_size)
-        if not found:
-            print('  %s に盤が無い' % os.path.basename(path))
-            continue
-        corner = refine(gray, corner)
-        image_points.append(corner)
-        object_points.append(pattern_points)
-        coverage.add(corner)
-        used.append(os.path.basename(path))
-    return object_points, image_points, used, size, coverage
+    def __init__(self, square_len):
+        self.pattern_points = np.zeros((np.prod(GRID_SIZE), 3), np.float32)
+        self.pattern_points[:, :2] = np.indices(GRID_SIZE).T.reshape(-1, 2)
+        self.pattern_points *= square_len
+        self.object_points = []
+        self.image_points = []
+        self.names = []
+        self.size = None
+        self.coverage = None
 
+    def _keep(self, corner, name):
+        self.image_points.append(corner)
+        self.object_points.append(self.pattern_points)
+        self.coverage.add(corner)
+        self.names.append(name)
 
-def collect_from_camera(args, grid_intersection_size, pattern_points):
-    """本家どおり、画面を見ながら撮って拾う。**画面のある機械でだけ使える**"""
-    if args.file is None:
+    def _prepare(self, gray):
+        if self.size is None:
+            self.size = (gray.shape[1], gray.shape[0])
+            self.coverage = Coverage(self.size[0], self.size[1],
+                                     int(np.prod(GRID_SIZE)))
+            return True
+        return (gray.shape[1], gray.shape[0]) == self.size
+
+    def from_video(self, path):
+        """**動画1本から、姿勢の違う枚だけを選って採る。**
+
+        全部の枚を採ってはいけない。30fps なら隣り合う枚はほぼ同じで、
+        **精度は上がらないのに時間だけ増え、よく写った区間に重みが偏る。**
+        """
+        cap = cv.VideoCapture(path)
+        if not cap.isOpened():
+            raise SystemExit('動画を開けません: %s' % path)
+        total = int(cap.get(cv.CAP_PROP_FRAME_COUNT) or 0)
+        print('動画 %s（%d枚 / %.1ffps）' % (
+            os.path.basename(path), total, cap.get(cv.CAP_PROP_FPS) or 0))
+
+        index, looked, blurred, found_count, last = -1, 0, 0, 0, None
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            index += 1
+            if index % VIDEO_STEP:
+                continue
+            looked += 1
+            gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            if not self._prepare(gray):
+                continue
+            if sharpness(gray) < MIN_SHARPNESS:
+                blurred += 1
+                continue
+            ok, corner = cv.findChessboardCorners(gray, GRID_SIZE)
+            if not ok:
+                continue
+            found_count += 1
+            corner = refine(gray, corner)
+
+            flat = np.asarray(corner).reshape(-1, 2)
+            moved = VIDEO_MIN_MOVE_PX if last is None else float(
+                np.linalg.norm(flat - last, axis=1).mean())
+            # **姿勢が変わったか、薄いマスが埋まるときだけ採る**
+            if moved < VIDEO_MIN_MOVE_PX and self.coverage.gain(corner) <= 0:
+                continue
+            if len(self.object_points) >= VIDEO_MAX_FRAMES:
+                continue
+            last = flat
+            self._keep(corner, '%.1fs' % (index / (cap.get(cv.CAP_PROP_FPS) or 30.0)))
+        cap.release()
+
+        print('  見た %d枚 / 盤が写っていた %d枚 / ブレて捨てた %d枚 / **採った %d枚**'
+              % (looked, found_count, blurred, len(self.object_points)))
+        return self
+
+    def from_images(self, paths):
+        print('画像 %d 枚' % len(paths))
+        for path in paths:
+            frame = cv.imread(path)
+            if frame is None:
+                continue
+            gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            if not self._prepare(gray):
+                print('  %s は大きさが違う（捨てた）' % os.path.basename(path))
+                continue
+            ok, corner = cv.findChessboardCorners(gray, GRID_SIZE)
+            if not ok:
+                print('  %s に盤が無い' % os.path.basename(path))
+                continue
+            self._keep(refine(gray, corner), os.path.basename(path))
+        return self
+
+    def from_camera(self):
+        """本家どおり、画面を見ながら撮る。**画面のある機械でだけ動く**"""
         # **CAP_DSHOW は Windows 専用。** Linux（走行体）で渡すと開けない
         if sys.platform.startswith('win'):
-            cap = cv.VideoCapture(args.device, cv.CAP_DSHOW)
+            cap = cv.VideoCapture(0, cv.CAP_DSHOW)
         else:
-            cap = cv.VideoCapture(args.device)
-        cap.set(cv.CAP_PROP_FRAME_WIDTH, args.width)
-        cap.set(cv.CAP_PROP_FRAME_HEIGHT, args.height)
-    else:
-        cap = cv.VideoCapture(args.file)
+            cap = cv.VideoCapture(0)
+        cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
 
-    interval_time = args.interval_time if args.use_autoappend else 10
-    object_points, image_points, size, coverage = [], [], None, None
-    capture_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            self._prepare(gray)
+            ok, corner = cv.findChessboardCorners(gray, GRID_SIZE)
+            if ok:
+                corner = refine(gray, corner)
+                cv.drawChessboardCorners(frame, GRID_SIZE, corner, ok)
+            cv.putText(frame, "Enter:Capture(%d)  ESC:Done  thin:%d" % (
+                len(self.object_points),
+                self.coverage.thin() if self.coverage else 12),
+                (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            cv.imshow('original', frame)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-        if size is None:
-            size = (gray.shape[1], gray.shape[0])
-            coverage = Coverage(size[0], size[1], np.prod(grid_intersection_size))
+            key = cv.waitKey(10) & 0xFF
+            if key == 13 and ok:  # Enter
+                self._keep(corner, 'frame%03d' % (len(self.object_points) + 1))
+            if key == 27:  # ESC
+                break
+        cap.release()
+        cv.destroyAllWindows()
+        return self
 
-        found, corner = cv.findChessboardCorners(gray, grid_intersection_size)
-        if found:
-            corner = refine(gray, corner)
-            print('findChessboardCorners() : True')
-            cv.drawChessboardCorners(frame, grid_intersection_size, corner, found)
-        else:
-            print('findChessboardCorners() : False')
 
-        cv.putText(frame, "Enter:Capture Chessboard(" + str(capture_count) + ")",
-                   (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-        cv.putText(frame, "ESC :Completes Calibration Photographing", (10, 55),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-        if coverage is not None:
-            cv.putText(frame, "thin cells: " + str(coverage.thin()), (10, 80),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-        cv.imshow('original', frame)
-
-        key = cv.waitKey(interval_time) & 0xFF
-        if ((args.use_autoappend and found)
-                or (not args.use_autoappend and key == 13 and found)):
-            image_points.append(corner)
-            object_points.append(pattern_points)
-            coverage.add(corner)
-            capture_count += 1
-        if key == 27:  # ESC
-            break
-
-    cap.release()
-    cv.destroyAllWindows()
-    names = ['frame%03d' % (i + 1) for i in range(len(object_points))]
-    return object_points, image_points, names, size, coverage
+def resolve_input(text):
+    """渡されたものが動画か、画像の束かを判断する"""
+    path = os.path.expanduser(text)
+    if os.path.isdir(path):
+        paths = sorted(p for p in glob.glob(os.path.join(path, '*'))
+                       if p.lower().endswith(IMAGE_EXT))
+        if not paths:
+            raise SystemExit('フォルダに画像がありません: %s' % path)
+        return 'images', paths
+    if path.lower().endswith(VIDEO_EXT):
+        if not os.path.exists(path):
+            raise SystemExit('動画が見つかりません: %s' % path)
+        return 'video', path
+    paths = sorted(glob.glob(path))
+    if not paths:
+        raise SystemExit('見つかりません: %s' % text)
+    return 'images', paths
 
 
 def main():
     args = get_args()
-    grid_intersection_size = parse_grid_size(args.grid_size)
+    collector = Collector(args.square_len)
 
-    # チェスボードの格子の、実寸での位置
-    pattern_points = np.zeros((np.prod(grid_intersection_size), 3), np.float32)
-    pattern_points[:, :2] = np.indices(grid_intersection_size).T.reshape(-1, 2)
-    pattern_points *= args.square_len
-
-    if args.images:
-        object_points, image_points, names, size, coverage = collect_from_images(
-            args.images, grid_intersection_size, pattern_points)
+    if args.input is None:
+        collector.from_camera()
     else:
-        object_points, image_points, names, size, coverage = collect_from_camera(
-            args, grid_intersection_size, pattern_points)
+        kind, value = resolve_input(args.input)
+        if kind == 'video':
+            collector.from_video(value)
+        else:
+            collector.from_images(value)
 
-    if len(image_points) < 5:
-        raise SystemExit('盤が取れたのが %d 枚しかありません。'
-                         '**10枚以上、四隅と傾きを入れて撮り直してください**'
-                         % len(image_points))
+    if len(collector.image_points) < 5:
+        raise SystemExit(
+            '\n盤が取れたのが %d 枚しかありません。**もう一度撮ってください。**\n'
+            '  ・盤を画面の四隅まで運ぶ（歪みは縁で効く）\n'
+            '  ・寝かせ・起こし・ひねる（正対ばかりだと焦点距離が決まらない）\n'
+            '  ・ゆっくり動かす（動画はブレやすい）'
+            % len(collector.image_points))
 
     print('\ncalibrateCamera()')
-    rms, K, d, r, t = cv.calibrateCamera(object_points, image_points, size,
-                                         None, None)
+    rms, K, d, r, t = cv.calibrateCamera(
+        collector.object_points, collector.image_points, collector.size,
+        None, None)
 
     # 1枚ごとの再投影誤差。**悪い1枚が全体を引っぱっていないかを見る**
     # **引く前に (N, 2) へそろえること。** projectPoints() は (N, 1, 2)、
     # findChessboardCorners() は版によって (N, 2) を返す。そろえずに引くと
     # (N, N, 2) へ広がり、もっともらしく大きい数字が出る
     per_image = []
-    for i in range(len(object_points)):
-        projected, _ = cv.projectPoints(object_points[i], r[i], t[i], K, d)
-        diff = projected.reshape(-1, 2) - np.asarray(image_points[i]).reshape(-1, 2)
+    for i in range(len(collector.object_points)):
+        projected, _ = cv.projectPoints(collector.object_points[i], r[i], t[i],
+                                        K, d)
+        diff = (projected.reshape(-1, 2)
+                - np.asarray(collector.image_points[i]).reshape(-1, 2))
         per_image.append(float(np.sqrt((diff ** 2).sum() / len(diff))))
 
-    shifts = edge_shift(K, d, size[0], size[1])
-    hfov = math.degrees(2 * math.atan(size[0] / 2 / K[0][0]))
-    vfov = math.degrees(2 * math.atan(size[1] / 2 / K[1][1]))
+    width, height = collector.size
+    shifts = edge_shift(K, d, width, height)
+    hfov = math.degrees(2 * math.atan(width / 2 / K[0][0]))
+    vfov = math.degrees(2 * math.atan(height / 2 / K[1][1]))
 
-    np.savetxt(args.k_filename, K, delimiter=',', fmt="%0.14f")
-    np.savetxt(args.d_filename, d, delimiter=',', fmt="%0.14f")
-    with open(args.json_filename, 'w') as f:
+    np.savetxt('K.csv', K, delimiter=',', fmt="%0.14f")
+    np.savetxt('d.csv', d, delimiter=',', fmt="%0.14f")
+    with open('calibration.json', 'w') as f:
         json.dump({
-            'width': size[0], 'height': size[1],
+            'width': width, 'height': height,
             'camera_matrix': K.tolist(), 'dist_coeffs': d.ravel().tolist(),
-            'rms_px': float(rms), 'images': len(object_points),
-            'square_len': args.square_len,
-            'grid_size': list(grid_intersection_size),
+            'rms_px': float(rms), 'images': len(collector.object_points),
+            'square_len': args.square_len, 'grid_size': list(GRID_SIZE),
             'hfov_deg': round(hfov, 2), 'vfov_deg': round(vfov, 2),
             'edge_shift_px': [round(s, 1) for s in shifts],
         }, f, ensure_ascii=False, indent=2)
 
-    print('\n使えた写真        %d 枚' % len(object_points))
+    print('\n使えた枚数        %d' % len(collector.object_points))
     print('残差 rms          %.3f px   %s' % (
-        rms, '良い' if rms < 0.5 else '**大きい。盤の反り・ぼけ・枚数を疑う**'))
+        rms, '良い' if rms < 0.5 else '**大きい。盤の反り・ブレ・枚数を疑う**'))
     print('焦点距離 fx / fy  %.1f / %.1f px' % (K[0][0], K[1][1]))
     print('画像の中心 cx/cy  %.1f / %.1f px（画面の中心は %.1f / %.1f）' % (
-        K[0][2], K[1][2], size[0] / 2, size[1] / 2))
+        K[0][2], K[1][2], width / 2, height / 2))
     print('画角              hfov %.2f°  vfov %.2f°' % (hfov, vfov))
     print('歪み k1 k2 p1 p2 k3  %s' % ' '.join(
         '%+.4f' % v for v in d.ravel()[:5]))
     print('\n**縁が動く量**    四隅 %s px / 上下の中央 %s px' % (
         [round(s, 1) for s in shifts[:4]], [round(s, 1) for s in shifts[4:]]))
-    worst = sorted(zip(per_image, names), reverse=True)[:3]
-    print('残差の悪い3枚     %s' % ', '.join('%s %.2fpx' % (n, v) for v, n in worst))
-    if coverage is not None:
+    worst = sorted(zip(per_image, collector.names), reverse=True)[:3]
+    print('残差の悪い3枚     %s' % ', '.join(
+        '%s %.2fpx' % (n, v) for v, n in worst))
+    if collector.coverage is not None:
         print('')
-        coverage.show()
-    print('\n書き出しました: %s / %s / %s' % (
-        args.k_filename, args.d_filename, args.json_filename))
+        collector.coverage.show()
+    print('\n書き出しました: K.csv / d.csv / calibration.json')
 
 
 if __name__ == '__main__':
