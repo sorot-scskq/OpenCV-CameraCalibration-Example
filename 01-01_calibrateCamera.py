@@ -113,6 +113,25 @@ class Coverage:
             print('全マス足りている。')
 
 
+def open_camera():
+    """開けたカメラを返す。**番号は指定しない**（機械によって違うので順に試す）"""
+    for device in range(4):
+        # **CAP_DSHOW は Windows 専用。** Linux（走行体）で渡すと開けない
+        if sys.platform.startswith('win'):
+            cap = cv.VideoCapture(device, cv.CAP_DSHOW)
+        else:
+            cap = cv.VideoCapture(device)
+        if cap.isOpened():
+            cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
+            return cap
+        cap.release()
+    raise SystemExit(
+        'カメラを開けません。\n'
+        '  ・別のプログラムが掴んでいないか（走行体なら `sudo pkill -f ev3_python`）\n'
+        '  ・`ls /dev/video*` でカメラが見えるか')
+
+
 def refine(gray, corner):
     """角を画素より細かく詰める。**ここを飛ばすと残差が倍になる**"""
     criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
@@ -228,39 +247,102 @@ class Collector:
         return self
 
     def from_camera(self):
-        """本家どおり、画面を見ながら撮る。**画面のある機械でだけ動く**"""
-        # **CAP_DSHOW は Windows 専用。** Linux（走行体）で渡すと開けない
-        if sys.platform.startswith('win'):
-            cap = cv.VideoCapture(0, cv.CAP_DSHOW)
-        else:
-            cap = cv.VideoCapture(0)
-        cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
+        """**カメラを映したまま、勝手に集めて勝手に終わる。**
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-            self._prepare(gray)
-            ok, corner = cv.findChessboardCorners(gray, GRID_SIZE)
-            if ok:
-                corner = refine(gray, corner)
-                cv.drawChessboardCorners(frame, GRID_SIZE, corner, ok)
-            cv.putText(frame, "Enter:Capture(%d)  ESC:Done  thin:%d" % (
-                len(self.object_points),
-                self.coverage.thin() if self.coverage else 12),
-                (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-            cv.imshow('original', frame)
+        キーを押す必要は無い。盤の姿勢が変わるか、薄いマスが埋まるときだけ採り、
+        **画面の全マスが埋まったら自分で止まって解きにいく。**
 
-            key = cv.waitKey(10) & 0xFF
-            if key == 13 and ok:  # Enter
-                self._keep(corner, 'frame%03d' % (len(self.object_points) + 1))
-            if key == 27:  # ESC
-                break
-        cap.release()
-        cv.destroyAllWindows()
+        画面が無い機械（SSH 越しの走行体）でも動く。窓が開けなければ、
+        文字だけで同じことを言う。
+        """
+        cap = open_camera()
+        window = True
+        print('カメラを開きました。**盤をカメラに見せてください。**')
+        print('  ・画面の四隅まで運ぶ（歪みは縁で効く）')
+        print('  ・寝かせ・起こし・ひねる（±30〜45°）')
+        print('  ・ゆっくり動かす')
+        print('**全部埋まれば自分で止まります。** 途中でやめるときは Ctrl-C。\n')
+
+        last, shown = None, -1
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+                self._prepare(gray)
+
+                ok, corner = cv.findChessboardCorners(gray, GRID_SIZE)
+                if ok and sharpness(gray) >= MIN_SHARPNESS:
+                    corner = refine(gray, corner)
+                    flat = np.asarray(corner).reshape(-1, 2)
+                    moved = VIDEO_MIN_MOVE_PX if last is None else float(
+                        np.linalg.norm(flat - last, axis=1).mean())
+                    if moved >= VIDEO_MIN_MOVE_PX or self.coverage.gain(corner) > 0:
+                        last = flat
+                        self._keep(corner, 'shot%03d' % (len(self.object_points) + 1))
+                elif ok:
+                    corner = None  # ブレている。写ってはいるので枠だけ描く
+
+                thin = self.coverage.thin() if self.coverage else COVER_COLS * COVER_ROWS
+                if len(self.object_points) != shown:
+                    shown = len(self.object_points)
+                    print('  採った %2d枚  **薄いマス %d**' % (shown, thin))
+
+                if window:
+                    window = self._draw(frame, ok, corner, thin)
+
+                # **全部埋まったら自分で止まる。** 枚数だけでは偏った束で止まりうる
+                if thin == 0 and len(self.object_points) >= 12:
+                    print('\n全マス埋まりました。解きにいきます。')
+                    break
+                # **埋まらないまま溜め続けない。** 40枚あれば足り、それ以上は
+                # 解くのが遅くなるだけ。埋まっていないなら撮り方のほうを直す
+                if len(self.object_points) >= VIDEO_MAX_FRAMES:
+                    print('\n%d枚まで集めました（**薄いマスが %d 残っています**）。'
+                          '解きにいきます。' % (VIDEO_MAX_FRAMES, thin))
+                    break
+                if cv.waitKey(1) & 0xFF == 27:  # ESC
+                    break
+        except KeyboardInterrupt:
+            print('\n止めました。集まったぶんで解きます。')
+        finally:
+            cap.release()
+            if window:
+                try:
+                    cv.destroyAllWindows()
+                except cv.error:
+                    pass
         return self
+
+    def _draw(self, frame, ok, corner, thin):
+        """窓に映す。**開けなければ二度と試さない**（画面の無い機械で毎周期失敗しない）"""
+        if ok and corner is not None:
+            cv.drawChessboardCorners(frame, GRID_SIZE, corner, ok)
+        cv.putText(frame, "kept:%d  thin:%d  (ESC to stop)" % (
+            len(self.object_points), thin),
+            (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if self.coverage is not None:
+            self._draw_coverage(frame)
+        try:
+            cv.imshow('calibration', frame)
+            return True
+        except cv.error:
+            print('（画面が無いので、文字だけで進めます）')
+            return False
+
+    def _draw_coverage(self, frame):
+        """**どこがまだ薄いかを画面に重ねる。** 見ながら盤を運べる"""
+        h, w = frame.shape[:2]
+        floor = 2 * int(np.prod(GRID_SIZE)) // 8
+        for r in range(COVER_ROWS):
+            for c in range(COVER_COLS):
+                if self.coverage.cells[r][c] >= floor:
+                    continue
+                x0, y0 = int(c * w / COVER_COLS), int(r * h / COVER_ROWS)
+                x1, y1 = int((c + 1) * w / COVER_COLS), int((r + 1) * h / COVER_ROWS)
+                cv.rectangle(frame, (x0 + 2, y0 + 2), (x1 - 2, y1 - 2),
+                             (0, 0, 255), 2)
 
 
 def resolve_input(text):
